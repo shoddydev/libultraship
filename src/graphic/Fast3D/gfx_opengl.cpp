@@ -11,7 +11,6 @@
 #ifndef _LANGUAGE_C
 #define _LANGUAGE_C
 #endif
-#include "libultraship/libultra/gbi.h"
 
 #ifdef __MINGW32__
 #define FOR_WINDOWS 1
@@ -31,17 +30,13 @@
 #elif __APPLE__
 #include <SDL2/SDL.h>
 #include <GL/glew.h>
-#elif __SWITCH__
-#include <SDL2/SDL.h>
-#include <glad/glad.h>
 #elif USE_OPENGLES
 #include <SDL2/SDL.h>
 #include <GLES3/gl3.h>
 #else
 #include <SDL2/SDL.h>
-#include <GL/glew.h>
 #define GL_GLEXT_PROTOTYPES 1
-// #include <SDL2/SDL_opengles2.h>
+#include <SDL2/SDL_opengl.h>
 #endif
 
 #include "gfx_cc.h"
@@ -79,7 +74,6 @@ static GLuint opengl_vbo;
 #if defined(__APPLE__) || defined(USE_OPENGLES)
 static GLuint opengl_vao;
 #endif
-static bool current_depth_mask;
 
 static uint32_t frame_count;
 
@@ -87,7 +81,14 @@ static vector<Framebuffer> framebuffers;
 static size_t current_framebuffer;
 static float current_noise_scale;
 static FilteringMode current_filter_mode = FILTER_THREE_POINT;
+static int8_t current_depth_test;
+static int8_t current_depth_mask;
+static int8_t current_zmode_decal;
+static int8_t last_depth_test;
+static int8_t last_depth_mask;
+static int8_t last_zmode_decal;
 
+GLint max_msaa_level = 1;
 GLuint pixel_depth_rb, pixel_depth_fb;
 size_t pixel_depth_rb_size;
 
@@ -153,7 +154,7 @@ static void append_line(char* buf, size_t* len, const char* str) {
 #define RAND_NOISE "((random(vec3(floor(gl_FragCoord.xy * noise_scale), float(frame_count))) + 1.0) / 2.0)"
 
 static const char* shader_item_to_str(uint32_t item, bool with_alpha, bool only_alpha, bool inputs_have_alpha,
-                                      bool hint_single_element) {
+                                      bool first_cycle, bool hint_single_element) {
     if (!only_alpha) {
         switch (item) {
             case SHADER_0:
@@ -169,17 +170,27 @@ static const char* shader_item_to_str(uint32_t item, bool with_alpha, bool only_
             case SHADER_INPUT_4:
                 return with_alpha || !inputs_have_alpha ? "vInput4" : "vInput4.rgb";
             case SHADER_TEXEL0:
-                return with_alpha ? "texVal0" : "texVal0.rgb";
+                return first_cycle ? (with_alpha ? "texVal0" : "texVal0.rgb")
+                                   : (with_alpha ? "texVal1" : "texVal1.rgb");
             case SHADER_TEXEL0A:
-                return hint_single_element ? "texVal0.a"
-                                           : (with_alpha ? "vec4(texVal0.a, texVal0.a, texVal0.a, texVal0.a)"
-                                                         : "vec3(texVal0.a, texVal0.a, texVal0.a)");
+                return first_cycle
+                           ? (hint_single_element ? "texVal0.a"
+                                                  : (with_alpha ? "vec4(texVal0.a, texVal0.a, texVal0.a, texVal0.a)"
+                                                                : "vec3(texVal0.a, texVal0.a, texVal0.a)"))
+                           : (hint_single_element ? "texVal1.a"
+                                                  : (with_alpha ? "vec4(texVal1.a, texVal1.a, texVal1.a, texVal1.a)"
+                                                                : "vec3(texVal1.a, texVal1.a, texVal1.a)"));
             case SHADER_TEXEL1A:
-                return hint_single_element ? "texVal1.a"
-                                           : (with_alpha ? "vec4(texVal1.a, texVal1.a, texVal1.a, texVal1.a)"
-                                                         : "vec3(texVal1.a, texVal1.a, texVal1.a)");
+                return first_cycle
+                           ? (hint_single_element ? "texVal1.a"
+                                                  : (with_alpha ? "vec4(texVal1.a, texVal1.a, texVal1.a, texVal1.a)"
+                                                                : "vec3(texVal1.a, texVal1.a, texVal1.a)"))
+                           : (hint_single_element ? "texVal0.a"
+                                                  : (with_alpha ? "vec4(texVal0.a, texVal0.a, texVal0.a, texVal0.a)"
+                                                                : "vec3(texVal0.a, texVal0.a, texVal0.a)"));
             case SHADER_TEXEL1:
-                return with_alpha ? "texVal1" : "texVal1.rgb";
+                return first_cycle ? (with_alpha ? "texVal1" : "texVal1.rgb")
+                                   : (with_alpha ? "texVal0" : "texVal0.rgb");
             case SHADER_COMBINED:
                 return with_alpha ? "texel" : "texel.rgb";
             case SHADER_NOISE:
@@ -201,13 +212,13 @@ static const char* shader_item_to_str(uint32_t item, bool with_alpha, bool only_
             case SHADER_INPUT_4:
                 return "vInput4.a";
             case SHADER_TEXEL0:
-                return "texVal0.a";
+                return first_cycle ? "texVal0.a" : "texVal1.a";
             case SHADER_TEXEL0A:
-                return "texVal0.a";
+                return first_cycle ? "texVal0.a" : "texVal1.a";
             case SHADER_TEXEL1A:
-                return "texVal1.a";
+                return first_cycle ? "texVal1.a" : "texVal0.a";
             case SHADER_TEXEL1:
-                return "texVal1.a";
+                return first_cycle ? "texVal1.a" : "texVal0.a";
             case SHADER_COMBINED:
                 return "texel.a";
             case SHADER_NOISE:
@@ -220,30 +231,40 @@ static const char* shader_item_to_str(uint32_t item, bool with_alpha, bool only_
 #undef RAND_NOISE
 
 static void append_formula(char* buf, size_t* len, uint8_t c[2][4], bool do_single, bool do_multiply, bool do_mix,
-                           bool with_alpha, bool only_alpha, bool opt_alpha) {
+                           bool with_alpha, bool only_alpha, bool opt_alpha, bool first_cycle) {
     if (do_single) {
-        append_str(buf, len, shader_item_to_str(c[only_alpha][3], with_alpha, only_alpha, opt_alpha, false));
+        append_str(buf, len,
+                   shader_item_to_str(c[only_alpha][3], with_alpha, only_alpha, opt_alpha, first_cycle, false));
     } else if (do_multiply) {
-        append_str(buf, len, shader_item_to_str(c[only_alpha][0], with_alpha, only_alpha, opt_alpha, false));
+        append_str(buf, len,
+                   shader_item_to_str(c[only_alpha][0], with_alpha, only_alpha, opt_alpha, first_cycle, false));
         append_str(buf, len, " * ");
-        append_str(buf, len, shader_item_to_str(c[only_alpha][2], with_alpha, only_alpha, opt_alpha, true));
+        append_str(buf, len,
+                   shader_item_to_str(c[only_alpha][2], with_alpha, only_alpha, opt_alpha, first_cycle, true));
     } else if (do_mix) {
         append_str(buf, len, "mix(");
-        append_str(buf, len, shader_item_to_str(c[only_alpha][1], with_alpha, only_alpha, opt_alpha, false));
+        append_str(buf, len,
+                   shader_item_to_str(c[only_alpha][1], with_alpha, only_alpha, opt_alpha, first_cycle, false));
         append_str(buf, len, ", ");
-        append_str(buf, len, shader_item_to_str(c[only_alpha][0], with_alpha, only_alpha, opt_alpha, false));
+        append_str(buf, len,
+                   shader_item_to_str(c[only_alpha][0], with_alpha, only_alpha, opt_alpha, first_cycle, false));
         append_str(buf, len, ", ");
-        append_str(buf, len, shader_item_to_str(c[only_alpha][2], with_alpha, only_alpha, opt_alpha, true));
+        append_str(buf, len,
+                   shader_item_to_str(c[only_alpha][2], with_alpha, only_alpha, opt_alpha, first_cycle, true));
         append_str(buf, len, ")");
     } else {
         append_str(buf, len, "(");
-        append_str(buf, len, shader_item_to_str(c[only_alpha][0], with_alpha, only_alpha, opt_alpha, false));
+        append_str(buf, len,
+                   shader_item_to_str(c[only_alpha][0], with_alpha, only_alpha, opt_alpha, first_cycle, false));
         append_str(buf, len, " - ");
-        append_str(buf, len, shader_item_to_str(c[only_alpha][1], with_alpha, only_alpha, opt_alpha, false));
+        append_str(buf, len,
+                   shader_item_to_str(c[only_alpha][1], with_alpha, only_alpha, opt_alpha, first_cycle, false));
         append_str(buf, len, ") * ");
-        append_str(buf, len, shader_item_to_str(c[only_alpha][2], with_alpha, only_alpha, opt_alpha, true));
+        append_str(buf, len,
+                   shader_item_to_str(c[only_alpha][2], with_alpha, only_alpha, opt_alpha, first_cycle, true));
         append_str(buf, len, " + ");
-        append_str(buf, len, shader_item_to_str(c[only_alpha][3], with_alpha, only_alpha, opt_alpha, false));
+        append_str(buf, len,
+                   shader_item_to_str(c[only_alpha][3], with_alpha, only_alpha, opt_alpha, first_cycle, false));
     }
 }
 
@@ -346,6 +367,9 @@ static struct ShaderProgram* gfx_opengl_create_and_load_new_shader(uint64_t shad
         vs_len += sprintf(vs_buf + vs_len, "vInput%d = aInput%d;\n", i + 1, i + 1);
     }
     append_line(vs_buf, &vs_len, "gl_Position = aVtxPos;");
+#if defined(USE_OPENGLES) // workaround for no GL_DEPTH_CLAMP
+    append_line(vs_buf, &vs_len, "gl_Position.z *= 0.3f;");
+#endif
     append_line(vs_buf, &vs_len, "}");
 
     // Fragment shader
@@ -517,29 +541,41 @@ static struct ShaderProgram* gfx_opengl_create_and_load_new_shader(uint64_t shad
 
     append_line(fs_buf, &fs_len, cc_features.opt_alpha ? "vec4 texel;" : "vec3 texel;");
     for (int c = 0; c < (cc_features.opt_2cyc ? 2 : 1); c++) {
+        if (c == 0) {
+            if (cc_features.opt_alpha) {
+                if (cc_features.c[c][1][2] == SHADER_COMBINED) {
+                    append_line(fs_buf, &fs_len, "texel.a = WRAP(texel.a, -1.01, 1.01);");
+                } else {
+                    append_line(fs_buf, &fs_len, "texel.a = WRAP(texel.a, -0.51, 1.51);");
+                }
+            }
+
+            if (cc_features.c[c][0][2] == SHADER_COMBINED) {
+                append_line(fs_buf, &fs_len, "texel.rgb = WRAP(texel.rgb, -1.01, 1.01);");
+            } else {
+                append_line(fs_buf, &fs_len, "texel.rgb = WRAP(texel.rgb, -0.51, 1.51);");
+            }
+        }
+
         append_str(fs_buf, &fs_len, "texel = ");
         if (!cc_features.color_alpha_same[c] && cc_features.opt_alpha) {
             append_str(fs_buf, &fs_len, "vec4(");
             append_formula(fs_buf, &fs_len, cc_features.c[c], cc_features.do_single[c][0],
-                           cc_features.do_multiply[c][0], cc_features.do_mix[c][0], false, false, true);
+                           cc_features.do_multiply[c][0], cc_features.do_mix[c][0], false, false, true, c == 0);
             append_str(fs_buf, &fs_len, ", ");
             append_formula(fs_buf, &fs_len, cc_features.c[c], cc_features.do_single[c][1],
-                           cc_features.do_multiply[c][1], cc_features.do_mix[c][1], true, true, true);
+                           cc_features.do_multiply[c][1], cc_features.do_mix[c][1], true, true, true, c == 0);
             append_str(fs_buf, &fs_len, ")");
         } else {
             append_formula(fs_buf, &fs_len, cc_features.c[c], cc_features.do_single[c][0],
                            cc_features.do_multiply[c][0], cc_features.do_mix[c][0], cc_features.opt_alpha, false,
-                           cc_features.opt_alpha);
+                           cc_features.opt_alpha, c == 0);
         }
         append_line(fs_buf, &fs_len, ";");
-
-        if (c == 0) {
-            append_str(fs_buf, &fs_len, "texel.rgb = WRAP(texel.rgb, -1.01, 1.01);");
-        }
     }
 
-    append_str(fs_buf, &fs_len, "texel.rgb = WRAP(texel.rgb, -0.51, 1.51);");
-    append_str(fs_buf, &fs_len, "texel.rgb = clamp(texel.rgb, 0.0, 1.0);");
+    append_str(fs_buf, &fs_len, "texel = WRAP(texel, -0.51, 1.51);");
+    append_str(fs_buf, &fs_len, "texel = clamp(texel, 0.0, 1.0);");
     // TODO discard if alpha is 0?
     if (cc_features.opt_fog) {
         if (cc_features.opt_alpha) {
@@ -752,7 +788,7 @@ static void gfx_opengl_upload_texture(const uint8_t* rgba32_buf, uint32_t width,
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba32_buf);
 }
 
-#if defined(__SWITCH__) || defined(USE_OPENGLES)
+#ifdef USE_OPENGLES
 #define GL_MIRROR_CLAMP_TO_EDGE 0x8743
 #endif
 
@@ -847,7 +883,7 @@ static void gfx_opengl_draw_triangles(float buf_vbo[], size_t buf_vbo_len, size_
 }
 
 static void gfx_opengl_init(void) {
-#if !defined(__SWITCH__) && !defined(USE_OPENGLES)
+#ifndef __linux__
     glewInit();
 #endif
 
@@ -878,6 +914,8 @@ static void gfx_opengl_init(void) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     pixel_depth_rb_size = 1;
+
+    glGetIntegerv(GL_MAX_SAMPLES, &max_msaa_level);
 }
 
 static void gfx_opengl_on_resize(void) {
@@ -933,6 +971,7 @@ static void gfx_opengl_update_framebuffer_parameters(int fb_id, uint32_t width, 
 
     width = max(width, 1U);
     height = max(height, 1U);
+    msaa_level = min(msaa_level, (uint32_t)max_msaa_level);
 
     glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
 
@@ -1000,9 +1039,15 @@ void gfx_opengl_resolve_msaa_color_buffer(int fb_id_target, int fb_id_source) {
     Framebuffer& fb_src = framebuffers[fb_id_source];
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb_dst.fbo);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, fb_src.fbo);
+
+    // Disabled for blit
+    glDisable(GL_SCISSOR_TEST);
+
     glBlitFramebuffer(0, 0, fb_src.width, fb_src.height, 0, 0, fb_dst.width, fb_dst.height, GL_COLOR_BUFFER_BIT,
                       GL_NEAREST);
     glBindFramebuffer(GL_FRAMEBUFFER, current_framebuffer);
+
+    glEnable(GL_SCISSOR_TEST);
 }
 
 void* gfx_opengl_get_framebuffer_texture_id(int fb_id) {
@@ -1015,13 +1060,91 @@ void gfx_opengl_select_texture_fb(int fb_id) {
     glBindTexture(GL_TEXTURE_2D, framebuffers[fb_id].clrbuf);
 }
 
+void gfx_opengl_copy_framebuffer(int fb_dst_id, int fb_src_id, int srcX0, int srcY0, int srcX1, int srcY1, int dstX0,
+                                 int dstY0, int dstX1, int dstY1) {
+    if (fb_dst_id >= (int)framebuffers.size() || fb_src_id >= (int)framebuffers.size()) {
+        return;
+    }
+
+    Framebuffer src = framebuffers[fb_src_id];
+    const Framebuffer& dst = framebuffers[fb_dst_id];
+
+    // Adjust y values for non-inverted source frame buffers because opengl uses bottom left for origin
+    if (!src.invert_y) {
+        int temp = srcY1 - srcY0;
+        srcY1 = src.height - srcY0;
+        srcY0 = srcY1 - temp;
+    }
+
+    // Flip the y values
+    if (src.invert_y != dst.invert_y) {
+        std::swap(srcY0, srcY1);
+    }
+
+    // Disabled for blit
+    glDisable(GL_SCISSOR_TEST);
+
+    // For msaa enabled buffers we can't perform a scaled blit to a simple sample buffer
+    // First do an unscaled blit to a msaa resolved buffer
+    if (src.height != dst.height && src.width != dst.width && src.msaa_level > 1) {
+        // Start with the main buffer (0) as the msaa resolved buffer
+        int fb_resolve_id = 0;
+        Framebuffer fb_resolve = framebuffers[fb_resolve_id];
+
+        // If the size doesn't match our source, then we need to use our separate color msaa resolved buffer (2)
+        if (fb_resolve.height != src.height || fb_resolve.width != src.width) {
+            fb_resolve_id = 2;
+            fb_resolve = framebuffers[fb_resolve_id];
+        }
+
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, src.fbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb_resolve.fbo);
+
+        glBlitFramebuffer(0, 0, src.width, src.height, 0, 0, src.width, src.height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+        // Switch source buffer to the resolved sample
+        fb_src_id = fb_resolve_id;
+        src = fb_resolve;
+    }
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, src.fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst.fbo);
+
+    // The 0 buffer is a double buffer so we need to choose the back to avoid imgui elements
+    if (fb_src_id == 0) {
+        glReadBuffer(GL_BACK);
+    } else {
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+    }
+
+    glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffers[current_framebuffer].fbo);
+
+    glReadBuffer(GL_BACK);
+
+    glEnable(GL_SCISSOR_TEST);
+}
+
+void gfx_opengl_read_framebuffer_to_cpu(int fb_id, uint32_t width, uint32_t height, uint16_t* rgba16_buf) {
+    if (fb_id >= (int)framebuffers.size()) {
+        return;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffers[fb_id].fbo);
+    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, (void*)rgba16_buf);
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffers[current_framebuffer].fbo);
+}
+
 static std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
 gfx_opengl_get_pixel_depth(int fb_id, const std::set<std::pair<float, float>>& coordinates) {
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> res;
 
     Framebuffer& fb = framebuffers[fb_id];
 
-    if (coordinates.size() == 1) {
+    // When looking up one value and the framebuffer is single-sampled, we can read pixels directly
+    // Otherwise we need to blit first to a new buffer then read it
+    if (coordinates.size() == 1 && fb.msaa_level <= 1) {
         uint32_t depth_stencil_value;
         glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
         int x = coordinates.begin()->first;
