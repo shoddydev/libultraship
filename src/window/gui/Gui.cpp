@@ -64,26 +64,16 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARA
 
 namespace LUS {
 #define TOGGLE_BTN ImGuiKey_F1
+#define TOGGLE_PSC ImGuiKey_KeypadSubtract
 #define TOGGLE_PAD_BTN ImGuiKey_GamepadBack
 
-Gui::Gui(std::shared_ptr<GuiWindow> customInputEditorWindow) : mNeedsConsoleVariableSave(false) {
+Gui::Gui() : mNeedsConsoleVariableSave(false) {
     mGameOverlay = std::make_shared<GameOverlay>();
     mInputViewer = std::make_shared<InputViewer>();
 
     AddGuiWindow(std::make_shared<StatsWindow>("gStatsEnabled", "Stats"));
-    if (customInputEditorWindow == nullptr) {
-        AddGuiWindow(std::make_shared<InputEditorWindow>("gControllerConfigurationEnabled", "Input Editor"));
-    } else {
-        AddGuiWindow(customInputEditorWindow);
-    }
-    AddGuiWindow(std::make_shared<ControllerDisconnectedWindow>("gControllerDisconnectedWindowEnabled",
-                                                                "Controller Disconnected"));
-    AddGuiWindow(
-        std::make_shared<ControllerReorderingWindow>("gControllerReorderingWindowEnabled", "Controller Reordering"));
+    AddGuiWindow(std::make_shared<InputEditorWindow>("gControllerConfigurationEnabled", "Input Editor"));
     AddGuiWindow(std::make_shared<ConsoleWindow>("gConsoleEnabled", "Console"));
-}
-
-Gui::Gui() : Gui(nullptr) {
 }
 
 Gui::~Gui() {
@@ -306,20 +296,6 @@ void Gui::Update(WindowEvent event) {
     }
 }
 
-bool Gui::ImGuiGamepadNavigationEnabled() {
-    return mImGuiIo->ConfigFlags & ImGuiConfigFlags_NavEnableGamepad;
-}
-
-void Gui::BlockImGuiGamepadNavigation() {
-    mImGuiIo->ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
-}
-
-void Gui::UnblockImGuiGamepadNavigation() {
-    if (CVarGetInteger("gControlNav", 0) && GetMenuBar() && GetMenuBar()->IsVisible()) {
-        mImGuiIo->ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
-    }
-}
-
 void Gui::DrawMenu() {
     LUS::Context::GetInstance()->GetWindow()->GetGui()->GetGuiWindow("Console")->Update();
     ImGuiBackendNewFrame();
@@ -363,15 +339,14 @@ void Gui::DrawMenu() {
 
     ImGui::DockSpace(dockId, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None | ImGuiDockNodeFlags_NoDockingInCentralNode);
 
-    if (ImGui::IsKeyPressed(TOGGLE_BTN) || (ImGui::IsKeyPressed(TOGGLE_PAD_BTN) && CVarGetInteger("gControlNav", 0))) {
+    if (ImGui::IsKeyPressed(TOGGLE_BTN) || (ImGui::IsKeyPressed(TOGGLE_PSC) || (ImGui::IsKeyPressed(TOGGLE_PAD_BTN) && CVarGetInteger("gControlNav", 0)))) {
         GetMenuBar()->ToggleVisibility();
         if (wnd->IsFullscreen()) {
             Context::GetInstance()->GetWindow()->SetCursorVisibility(GetMenuBar() && GetMenuBar()->IsVisible());
         }
+        Context::GetInstance()->GetControlDeck()->SaveSettings();
         if (CVarGetInteger("gControlNav", 0) && GetMenuBar() && GetMenuBar()->IsVisible()) {
             mImGuiIo->ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
-        } else {
-            mImGuiIo->ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
         }
     }
 
@@ -612,15 +587,15 @@ void Gui::StartFrame() {
     ImVec2 pos = ImVec2(0, 0);
     if (CVarGetInteger("gLowResMode", 0) == 1) { // N64 Mode takes priority
         const float sw = size.y * 320.0f / 240.0f;
-        pos = ImVec2(floor(size.x / 2 - sw / 2), 0);
+        pos = ImVec2(size.x / 2 - sw / 2, 0);
         size = ImVec2(sw, size.y);
     } else if (CVarGetInteger("gAdvancedResolution.Enabled", 0)) {
         if (!CVarGetInteger("gAdvancedResolution.PixelPerfectMode", 0)) {
             if (!CVarGetInteger("gAdvancedResolution.IgnoreAspectCorrection", 0)) {
                 float sWdth = size.y * gfx_current_dimensions.width / gfx_current_dimensions.height;
                 float sHght = size.x * gfx_current_dimensions.height / gfx_current_dimensions.width;
-                float sPosX = floor(size.x / 2.0f - sWdth / 2.0f);
-                float sPosY = floor(size.y / 2.0f - sHght / 2.0f);
+                float sPosX = size.x / 2 - sWdth / 2;
+                float sPosY = size.y / 2 - sHght / 2;
                 if (sPosY < 0.0f) { // pillarbox
                     sPosY = 0.0f;   // clamp y position
                     sHght = size.y; // reset height
@@ -634,8 +609,8 @@ void Gui::StartFrame() {
             }
         } else { // in pixel perfect mode it's much easier
             const int factor = GetIntegerScaleFactor();
-            float sPosX = floor(size.x / 2.0f - (gfx_current_dimensions.width * factor) / 2.0f);
-            float sPosY = floor(size.y / 2.0f - (gfx_current_dimensions.height * factor) / 2.0f);
+            float sPosX = size.x / 2 - (gfx_current_dimensions.width * factor) / 2;
+            float sPosY = size.y / 2 - (gfx_current_dimensions.height * factor) / 2;
             pos = ImVec2(sPosX, sPosY);
             size = ImVec2(float(gfx_current_dimensions.width) * factor, float(gfx_current_dimensions.height) * factor);
         }
