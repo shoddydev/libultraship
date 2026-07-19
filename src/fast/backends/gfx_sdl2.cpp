@@ -44,6 +44,12 @@
 LONG_PTR SDL_WndProc;
 #endif
 
+
+extern "C" {
+    // This allows the C++ backend to read the N64 game logic state
+    extern int gRaceState; // Change 'int' to 's32' or 's16' if your codebase requires it
+}
+
 namespace Fast {
 const SDL_Scancode lus_to_sdl_table[] = {
     SDL_SCANCODE_UNKNOWN,
@@ -266,11 +272,41 @@ void GfxWindowBackendSDL2::SetFullscreenImpl(bool on, bool call_callback) {
 }
 
 void GfxWindowBackendSDL2::GetActiveWindowRefreshRate(uint32_t* refresh_rate) {
-    int display_in_use = SDL_GetWindowDisplayIndex(mWnd);
+    // Static cache so we only query the OS and print the log exactly once
+    static uint32_t cached_refresh_rate = 0;
 
-    SDL_DisplayMode mode;
-    SDL_GetCurrentDisplayMode(display_in_use, &mode);
-    *refresh_rate = mode.refresh_rate != 0 ? mode.refresh_rate : 60;
+    // If we already figured out the refresh rate, just return it instantly
+    if (cached_refresh_rate != 0) {
+        *refresh_rate = cached_refresh_rate;
+        return;
+    }
+
+    int display_in_use = SDL_GetWindowDisplayIndex(mWnd);
+    
+    if (display_in_use < 0) {
+        SPDLOG_WARN("Cannot get the window display index: {}", SDL_GetError());
+    } else {
+        SDL_DisplayMode mode{};
+        
+        // Flycast Primary Method: Query the desktop display mode
+        if (SDL_GetDesktopDisplayMode(display_in_use, &mode) == 0) {
+            SPDLOG_INFO("Monitor refresh rate: {} Hz ({} x {})", mode.refresh_rate, mode.w, mode.h);
+            if (mode.refresh_rate > 0) {
+                cached_refresh_rate = mode.refresh_rate;
+                *refresh_rate = cached_refresh_rate;
+            }
+        } 
+        // Flycast Fallback Method: Query driver index 0 directly
+        else if (SDL_GetDisplayMode(display_in_use, 0, &mode) == 0) {
+            SPDLOG_INFO("Monitor refresh rate (Index 0): {} Hz ({} x {})", mode.refresh_rate, mode.w, mode.h);
+            if (mode.refresh_rate > 0) {
+                cached_refresh_rate = mode.refresh_rate;
+                *refresh_rate = cached_refresh_rate;
+            }
+        } else {
+            SPDLOG_WARN("Failed to get display mode: {}", SDL_GetError());
+        }
+    }
 }
 
 static uint64_t previous_time;
@@ -395,9 +431,14 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
         }
 
         mCtx = SDL_GL_CreateContext(mWnd);
-
         SDL_GL_MakeCurrent(mWnd, mCtx);
-        SDL_GL_SetSwapInterval(mVsyncEnabled ? 1 : 0);
+
+        // Dynamically apply Standard VSync (1) or Off (0)
+        if (mVsyncEnabled) {
+            SDL_GL_SetSwapInterval(1); 
+        } else {
+            SDL_GL_SetSwapInterval(0);
+        }
 
         window_impl.Opengl = { mWnd, mCtx };
     } else {
@@ -476,16 +517,20 @@ bool GfxWindowBackendSDL2::GetMouseState(uint32_t btn) {
 
 void GfxWindowBackendSDL2::SetMouseCapture(bool capture) {
     SDL_SetRelativeMouseMode(static_cast<SDL_bool>(capture));
-    // TODO: Manually setting a clipping rect here because
-    // https://wiki.libsdl.org/SDL2/SDL_HINT_MOUSE_RELATIVE_MODE_CENTER isn't working as epxected.
-    // Revisit on SDL3
-    auto mouse = SDL_GetWindowMouseRect(mWnd);
+    
+    // --- PS CLASSIC 2.0.14 COMPATIBILITY OVERRIDE ---
+    // We comment out the 2.0.18 mouse rect functions.
+    // Compiling with 2.0.18 headers forces a runtime dependency that 
+    // the PS Classic's 2.0.14 dynamic library cannot satisfy.
+    
+    /* auto mouse = SDL_GetWindowMouseRect(mWnd);
     if (capture) {
         int w, h;
         SDL_GetWindowSize(mWnd, &w, &h);
         mCursorClip = { (w / 2) - 1, (h / 2) - 1, 2, 2 };
     }
     SDL_SetWindowMouseRect(mWnd, capture ? &mCursorClip : NULL);
+    */
 }
 
 bool GfxWindowBackendSDL2::IsMouseCaptured() {
@@ -567,6 +612,21 @@ void GfxWindowBackendSDL2::HandleSingleEvent(SDL_Event& event) {
 #ifndef TARGET_WEB
         // Scancodes are broken in Emscripten SDL2: https://bugzilla.libsdl.org/show_bug.cgi?id=3259
         case SDL_KEYDOWN:
+            // PS Classic Reset button killswitch (keycode 164)
+            if (event.key.keysym.scancode == SDL_SCANCODE_AUDIOPLAY) {
+                SDL_Event quit;
+                quit.type = SDL_QUIT;
+                SDL_PushEvent(&quit);
+                return;
+            }
+            
+            // PS Classic Eject button -> Direct Menu Toggle
+            if (event.key.keysym.scancode == SDL_SCANCODE_EJECT) {
+                auto gui = Ship::Context::GetInstance()->GetWindow()->GetGui();
+                gui->GetMenu()->ToggleVisibility();
+                return; // Prevents the Eject key from doing anything else
+            }
+
             OnKeydown(event.key.keysym.scancode);
             break;
         case SDL_KEYUP:
@@ -642,45 +702,63 @@ static uint64_t qpc_to_100ns(uint64_t qpc) {
 }
 
 void GfxWindowBackendSDL2::SyncFramerateWithTime() const {
+    // 1. Get current time once
     uint64_t t = qpc_to_100ns(SDL_GetPerformanceCounter());
 
-    const int64_t next = previous_time + 10 * FRAME_INTERVAL_US_NUMERATOR / FRAME_INTERVAL_US_DENOMINATOR;
+    // 2. Pre-calculate the exact frame target grid line
+    const int64_t frame_target = 10 * FRAME_INTERVAL_US_NUMERATOR / FRAME_INTERVAL_US_DENOMINATOR;
+    const int64_t next = previous_time + frame_target;
     int64_t left = next - t;
-#ifdef _WIN32
-    // We want to exit a bit early, so we can busy-wait the rest to never miss the deadline
-    left -= 15000UL;
-#elif defined(__APPLE__)
-    // Use macOS scheduler interval on macOS
-    left -= 10000UL;
-#endif
-    if (left > 0) {
-#ifndef _WIN32
-        const timespec spec = { 0, left * 100 };
-        nanosleep(&spec, nullptr);
-#else
-        // The accuracy of this mTimer seems to usually be within +- 1.0 ms
-        LARGE_INTEGER li;
-        li.QuadPart = -left;
-        SetWaitableTimer(mTimer, &li, 0, nullptr, nullptr, false);
-        WaitForSingleObject(mTimer, INFINITE);
-#endif
-    }
 
-#ifdef _WIN32
-    t = qpc_to_100ns(SDL_GetPerformanceCounter());
-    while (t < next) {
-        YieldProcessor(); // TODO: Find a way for other compilers, OSes and architectures
+    if (mVsyncEnabled) {
+        // ====================================================================
+        // PATH A: OPTIMIZED JITTER FIX METHOD (VSync Enabled)
+        // ====================================================================
+        
+        // Keep your proven 3ms window so the 4.4.22 kernel never oversleeps
+        left -= 30000; 
+
+        if (left > 0) {
+            const timespec spec = { 0, left * 100 };
+            nanosleep(&spec, nullptr);
+        }
+
+        // OPTIMIZATION 1: Read the clock exactly once right before entering the loop
         t = qpc_to_100ns(SDL_GetPerformanceCounter());
-    }
+
+#if defined(__arm__) || defined(__aarch64__)
+        // OPTIMIZATION 2: Tell GCC/Clang that this loop condition is highly likely.
+        // This optimizes assembly branch prediction on the Cortex-A7.
+        while (__builtin_expect(t < next, 1)) {
+            __asm__ __volatile__("yield" : : : "memory");
+            t = qpc_to_100ns(SDL_GetPerformanceCounter());
+        }
 #endif
-    t = qpc_to_100ns(SDL_GetPerformanceCounter());
-    if (left > 0 && t - next < 10000) {
-        // In case it takes some time for the application to wake up after sleep,
-        // or inaccurate mTimer,
-        // don't let that slow down the framerate.
-        t = next;
+
+        // Time-Debt Protection Guard
+        t = qpc_to_100ns(SDL_GetPerformanceCounter());
+        if (t - next < frame_target / 2) {
+            previous_time = next; // Snap perfectly to your 30 FPS grid line
+        } else {
+            previous_time = t;    // Hard-reset on genuine lag
+        }
+
+    } else {
+        // ====================================================================
+        // PATH B: LIGHTWEIGHT STOCK METHOD (VSync Disabled)
+        // ====================================================================
+        if (left > 0) {
+            const timespec spec = { 0, static_cast<long>(left * 100) };
+            nanosleep(&spec, nullptr);
+
+            t = qpc_to_100ns(SDL_GetPerformanceCounter());
+            
+            if (t - next < 10000) {
+                t = next;
+            }
+        } 
+        previous_time = t;
     }
-    previous_time = t;
 }
 
 void GfxWindowBackendSDL2::SwapBuffersBegin() {
@@ -689,10 +767,12 @@ void GfxWindowBackendSDL2::SwapBuffersBegin() {
     if (mVsyncEnabled != nextVsyncEnabled) {
         mVsyncEnabled = nextVsyncEnabled;
         SDL_GL_SetSwapInterval(mVsyncEnabled ? 1 : 0);
-        SDL_RenderSetVSync(mRenderer, mVsyncEnabled ? 1 : 0);
     }
 
+    // 1. Precise software lock and timeline evaluation
     SyncFramerateWithTime();
+    
+    // 2. Pass the finalized frame to the Wayland compositor
     SDL_GL_SwapWindow(mWnd);
 }
 

@@ -284,8 +284,35 @@ bool Gui::SupportsViewports() {
 void Gui::HandleWindowEvents(WindowEvent event) {
     switch (Context::GetInstance()->GetWindow()->GetWindowBackend()) {
         case WindowBackend::FAST3D_SDL_OPENGL:
-        case WindowBackend::FAST3D_SDL_METAL:
-            ImGui_ImplSDL2_ProcessEvent(static_cast<const SDL_Event*>(event.Sdl.Event));
+        case WindowBackend::FAST3D_SDL_METAL: {
+            const SDL_Event* e = static_cast<const SDL_Event*>(event.Sdl.Event);
+            ImGui_ImplSDL2_ProcessEvent(e);
+
+            if (e->type == SDL_JOYAXISMOTION || e->type == SDL_CONTROLLERAXISMOTION) {
+                ImGuiIO& io = ImGui::GetIO();
+
+                // Only feed ImGui if the menu is active/mouse is NOT captured
+                if (!Context::GetInstance()->GetWindow()->IsMouseCaptured()) {
+                    int axis = (e->type == SDL_CONTROLLERAXISMOTION) ? e->caxis.axis : e->jaxis.axis;
+                    int value = (e->type == SDL_CONTROLLERAXISMOTION) ? e->caxis.value : e->jaxis.value;
+                    int deadzone = 16000;
+
+                    if (axis == 0) { // X Axis
+                        io.AddKeyEvent(ImGuiKey_GamepadDpadRight, value > deadzone);
+                        io.AddKeyEvent(ImGuiKey_GamepadDpadLeft, value < -deadzone);
+                    } else if (axis == 1) { // Y Axis
+                        io.AddKeyEvent(ImGuiKey_GamepadDpadDown, value > deadzone);
+                        io.AddKeyEvent(ImGuiKey_GamepadDpadUp, value < -deadzone);
+                    }
+                } else {
+                    // Game is playing: force clear to prevent ghost inputs when closing menu
+                    io.AddKeyEvent(ImGuiKey_GamepadDpadRight, false);
+                    io.AddKeyEvent(ImGuiKey_GamepadDpadLeft, false);
+                    io.AddKeyEvent(ImGuiKey_GamepadDpadDown, false);
+                    io.AddKeyEvent(ImGuiKey_GamepadDpadUp, false);
+                }
+            }
+        }
 #if defined(__ANDROID__) || defined(__IOS__)
             Mobile::ImGuiProcessEvent(mImGuiIo->WantTextInput);
 #endif
@@ -528,15 +555,18 @@ void Gui::DrawMenu() {
 
     ImGui::DockSpace(dockId, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None | ImGuiDockNodeFlags_NoDockingInCentralNode);
 
+    // --- 1. HANDLE INPUT TOGGLES (Only runs on the exact frame a key is pressed) ---
     if (ImGui::IsKeyPressed(TOGGLE_BTN, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false) ||
         (ImGui::IsKeyPressed(TOGGLE_PAD_BTN, false) &&
          Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_IMGUI_CONTROLLER_NAV, 0))) {
+        
         if ((ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(TOGGLE_PAD_BTN, false)) && GetMenu()) {
             GetMenu()->ToggleVisibility();
         } else if ((ImGui::IsKeyPressed(TOGGLE_BTN, false) || ImGui::IsKeyPressed(TOGGLE_PAD_BTN, false)) &&
                    GetMenuBar()) {
             GetMenuBar()->ToggleVisibility();
         }
+        
         if (!GetMenuOrMenubarVisible()) {
             Context::GetInstance()->GetWindow()->SetMouseCapture(wnd->ShouldAutoCaptureMouse());
         } else {
@@ -545,12 +575,15 @@ void Gui::DrawMenu() {
             auto wnd = std::dynamic_pointer_cast<Fast::Fast3dWindow>(Context::GetInstance()->GetWindow());
             mCursorVisibleTicks = mCursorVisibleSeconds * wnd->GetTargetFps();
         }
-        if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_IMGUI_CONTROLLER_NAV, 0) &&
-            GetMenuOrMenubarVisible()) {
-            mImGuiIo->ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
-        } else {
-            mImGuiIo->ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
-        }
+    } // <-- The keypress IF block now safely ends here
+
+    // --- 2. GAMEPAD NAV STATE SYNC (Runs EVERY SINGLE FRAME) ---
+    // This makes sure gamepad polling instantly stops the moment the menu goes invisible!
+    if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_IMGUI_CONTROLLER_NAV, 0) &&
+        GetMenuOrMenubarVisible()) {
+        mImGuiIo->ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+    } else {
+        mImGuiIo->ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
     }
 
     // Mac interprets this as cmd+r when io.ConfigMacOSXBehavior is on (on by default)
@@ -580,7 +613,9 @@ void Gui::DrawMenu() {
 }
 
 void Gui::HandleMouseCapture() {
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoMouseInputs;
+    // Added NoNavInputs to match the mouse behavior
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoMouseInputs | ImGuiWindowFlags_NoNavInputs; 
+    
     for (auto windowIter : ImGui::GetCurrentContext()->WindowsById.Data) {
         if (windowIter.key != GetMainGameWindowID() && windowIter.key != GetGameOverlay()->GetID()) {
             ImGuiWindow* window = (ImGuiWindow*)windowIter.val_p;

@@ -5,6 +5,10 @@
 #include "ship/window/gui/Gui.h"
 
 namespace Ship {
+
+// Pulls the flag from StatsWindow.cpp so it can look inside that 1-second burst
+extern bool gStatsTimerStarted;
+
 GuiWindow::GuiWindow(const std::string& consoleVariable, bool isVisible, const std::string& name, ImVec2 originalSize,
                      uint32_t windowFlags)
     : GuiElement(isVisible), mName(name), mVisibilityConsoleVariable(consoleVariable), mOriginalSize(originalSize),
@@ -63,19 +67,47 @@ void GuiWindow::SyncVisibilityConsoleVariable() {
 }
 
 void GuiWindow::Draw() {
+    // Exit immediately if the window is closed to keep ImGui stack metrics pristine
     if (!IsVisible()) {
         return;
     }
+
+    ImGuiWindowFlags flags = mWindowFlags;
+
+    // Blank out the window layout ONLY during the 1-second pop sequence
+    bool shouldBlankOut = gStatsTimerStarted && (mName == "Stats");
+
+    if (shouldBlankOut) {
+        // Drop title bars, backgrounds, borders, and grips into pure transparency
+        ImGui::PushStyleColor(ImGuiCol_TitleBg, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_ResizeGrip, ImVec4(0, 0, 0, 0));
+        
+        // Blank out text inside DrawElement completely
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0, 0, 0, 0));
+
+        // Kill the structural line footprint
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    }
+
     if (mOriginalSize != ImVec2{ -1, -1 }) {
         ImGui::SetNextWindowSize(mOriginalSize, ImGuiCond_FirstUseEver);
     }
-    if (!ImGui::Begin(mName.c_str(), &mIsVisible, mWindowFlags)) {
+
+    if (!ImGui::Begin(mName.c_str(), &mIsVisible, flags)) {
         ImGui::End();
     } else {
-        DrawElement();
+        DrawElement(); 
         ImGui::End();
     }
-    // Sync up the IsVisible flag if it was changed by ImGui
+
+    if (shouldBlankOut) {
+        // Balanced stack unwinding
+        ImGui::PopStyleColor(5); 
+        ImGui::PopStyleVar();
+    }
+
     SyncVisibilityConsoleVariable();
 }
 
@@ -86,7 +118,6 @@ std::string GuiWindow::GetName() {
 void GuiWindow::BeginGroupPanel(const char* name, const ImVec2& size) {
     ImGui::BeginGroup();
 
-    // auto cursorPos = ImGui::GetCursorScreenPos();
     auto itemSpacing = ImGui::GetStyle().ItemSpacing;
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
@@ -113,8 +144,6 @@ void GuiWindow::BeginGroupPanel(const char* name, const ImVec2& size) {
     ImGui::SameLine(0.0f, 0.0f);
     ImGui::Dummy(ImVec2(0.0, frameHeight + itemSpacing.y));
     ImGui::BeginGroup();
-
-    // ImGui::GetWindowDrawList()->AddRect(labelMin, labelMax, IM_COL32(255, 0, 255, 255));
 
     ImGui::PopStyleVar(2);
 
@@ -154,7 +183,6 @@ void GuiWindow::EndGroupPanel(float minHeight) {
 
     auto itemMin = ImGui::GetItemRectMin();
     auto itemMax = ImGui::GetItemRectMax();
-    // ImGui::GetWindowDrawList()->AddRectFilled(itemMin, itemMax, IM_COL32(255, 0, 0, 64), 4.0f);
 
     auto labelRect = mGroupPanelLabelStack.back();
     mGroupPanelLabelStack.pop_back();
@@ -165,19 +193,15 @@ void GuiWindow::EndGroupPanel(float minHeight) {
     labelRect.Max.x += itemSpacing.x;
     for (int i = 0; i < 4; ++i) {
         switch (i) {
-            // left half-plane
             case 0:
                 ImGui::PushClipRect(ImVec2(-FLT_MAX, -FLT_MAX), ImVec2(labelRect.Min.x, FLT_MAX), true);
                 break;
-                // right half-plane
             case 1:
                 ImGui::PushClipRect(ImVec2(labelRect.Max.x, -FLT_MAX), ImVec2(FLT_MAX, FLT_MAX), true);
                 break;
-                // top
             case 2:
                 ImGui::PushClipRect(ImVec2(labelRect.Min.x, -FLT_MAX), ImVec2(labelRect.Max.x, labelRect.Min.y), true);
                 break;
-                // bottom
             case 3:
                 ImGui::PushClipRect(ImVec2(labelRect.Min.x, labelRect.Max.y), ImVec2(labelRect.Max.x, FLT_MAX), true);
                 break;

@@ -695,7 +695,7 @@ void GfxRenderingAPIOGL::StartFrame() {
 }
 
 void GfxRenderingAPIOGL::EndFrame() {
-    glFlush();
+ //   glFlush();
 }
 
 void GfxRenderingAPIOGL::FinishRender() {
@@ -740,7 +740,7 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, 
 
     width = std::max(width, 1U);
     height = std::max(height, 1U);
-    msaa_level = std::min(msaa_level, (uint32_t)mMaxMsaaLevel);
+    msaa_level = 1; // Force MSAA off for PSC performance
 
     glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
 
@@ -763,7 +763,7 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, 
             (fb.width != width || fb.height != height || fb.msaa_level != msaa_level || !fb.has_depth_buffer)) {
             glBindRenderbuffer(GL_RENDERBUFFER, fb.rbo);
             if (msaa_level <= 1) {
-                glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
+                glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, width, height);
             } else {
                 glRenderbufferStorageMultisample(GL_RENDERBUFFER, msaa_level, GL_DEPTH24_STENCIL8, width, height);
             }
@@ -798,7 +798,13 @@ void GfxRenderingAPIOGL::ClearFramebuffer(bool color, bool depth) {
     glDisable(GL_SCISSOR_TEST);
     glDepthMask(GL_TRUE);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    
+    // PSC FIX: Force the GPU to finish the previous frame's 720p 
+    // work before clearing. This kills the 'pipeline lag'.
+    glFinish(); 
+
     glClear((color ? GL_COLOR_BUFFER_BIT : 0) | (depth ? GL_DEPTH_BUFFER_BIT : 0));
+    
     glDepthMask(mCurrentDepthMask ? GL_TRUE : GL_FALSE);
     glEnable(GL_SCISSOR_TEST);
 }
@@ -835,13 +841,14 @@ void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0
         return;
     }
 
-    FramebufferOGL src = mFrameBuffers[fb_src_id];
+    // Optimization: Use references instead of copying the struct
+    const FramebufferOGL& src = mFrameBuffers[fb_src_id];
     const FramebufferOGL& dst = mFrameBuffers[fb_dst_id];
 
-    // Adjust y values for non-inverted source frame buffers because opengl uses bottom left for origin
+    // Adjust y values for non-inverted source frame buffers
     if (!src.invertY) {
         int temp = srcY1 - srcY0;
-        srcY1 = src.height - srcY0;
+        srcY1 = (int)src.height - srcY0;
         srcY0 = srcY1 - temp;
     }
 
@@ -850,34 +857,17 @@ void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0
         std::swap(srcY0, srcY1);
     }
 
-    // Disabled for blit
     glDisable(GL_SCISSOR_TEST);
 
-    // For msaa enabled buffers we can't perform a scaled blit to a simple sample buffer
-    // First do an unscaled blit to a msaa resolved buffer
-    if (src.height != dst.height && src.width != dst.width && src.msaa_level > 1) {
-        // Start with the main buffer (0) as the msaa resolved buffer
-        int fb_resolve_id = 0;
-        FramebufferOGL fb_resolve = mFrameBuffers[fb_resolve_id];
-
-        // If the size doesn't match our source, then we need to use our separate color msaa resolved buffer (2)
-        if (fb_resolve.height != src.height || fb_resolve.width != src.width) {
-            fb_resolve_id = 2;
-            fb_resolve = mFrameBuffers[fb_resolve_id];
-        }
-
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, src.fbo);
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb_resolve.fbo);
-
-        glBlitFramebuffer(0, 0, src.width, src.height, 0, 0, src.width, src.height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-
-        // Switch source buffer to the resolved sample
-        fb_src_id = fb_resolve_id;
-        src = fb_resolve;
-    }
+    // Removed MSAA Resolve logic - we forced MSAA to 1, so this is now dead weight.
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, src.fbo);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst.fbo);
+
+    // PSC Efficiency: Tell the GPU to discard previous depth/stencil data for the target
+    // so it doesn't waste bandwidth loading it before the blit.
+    GLenum invalidate_attachments[] = { GL_DEPTH_ATTACHMENT, GL_STENCIL_ATTACHMENT };
+    glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 2, invalidate_attachments);
 
     // The 0 buffer is a double buffer so we need to choose the back to avoid imgui elements
     if (fb_src_id == 0) {
@@ -886,12 +876,12 @@ void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0
         glReadBuffer(GL_COLOR_ATTACHMENT0);
     }
 
+    // Scaled or unscaled blit
     glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
+    // Restore state
     glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
-
     glReadBuffer(GL_BACK);
-
     glEnable(GL_SCISSOR_TEST);
 }
 
@@ -994,3 +984,5 @@ ImTextureID GfxRenderingAPIOGL::GetTextureById(int id) {
 #endif
 
 #pragma clang diagnostic pop
+
+

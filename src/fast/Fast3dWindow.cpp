@@ -75,7 +75,7 @@ void Fast3dWindow::Init() {
     uint32_t width, height;
     int32_t posX, posY;
 
-    isFullscreen = Ship::Context::GetInstance()->GetConfig()->GetBool("Window.Fullscreen.Enabled", false) || gameMode;
+    isFullscreen = Ship::Context::GetInstance()->GetConfig()->GetBool("Window.Fullscreen.Enabled", true) || gameMode;
     posX = Ship::Context::GetInstance()->GetConfig()->GetInt("Window.PositionX", 100);
     posY = Ship::Context::GetInstance()->GetConfig()->GetInt("Window.PositionY", 100);
 
@@ -99,7 +99,7 @@ void Fast3dWindow::Init() {
     mWindowManagerApi->SetMouseCallbacks(MouseButtonDown, MouseButtonUp);
 
     SetTextureFilter((FilteringMode)Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(
-        CVAR_TEXTURE_FILTER, FILTER_THREE_POINT));
+        CVAR_TEXTURE_FILTER, FILTER_LINEAR));
 }
 
 int32_t Fast3dWindow::GetTargetFps() {

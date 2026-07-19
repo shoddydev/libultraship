@@ -1409,26 +1409,34 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     bool depth_mask = (mRdp->other_mode_l & Z_UPD) == Z_UPD;
     uint8_t depth_test_and_mask = (depth_test ? 1 : 0) | (depth_mask ? 2 : 0);
     if (depth_test_and_mask != mRenderingState.depth_test_and_mask) {
-        Flush();
+if (mBufVboLen > 0) {
+    Flush();
+}
         mRapi->SetDepthTestAndMask(depth_test, depth_mask);
         mRenderingState.depth_test_and_mask = depth_test_and_mask;
     }
 
     bool zmode_decal = (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_DEC;
     if (zmode_decal != mRenderingState.decal_mode) {
-        Flush();
+if (mBufVboLen > 0) {
+    Flush();
+}
         mRapi->SetZmodeDecal(zmode_decal);
         mRenderingState.decal_mode = zmode_decal;
     }
 
     if (mRdp->viewport_or_scissor_changed) {
         if (memcmp(&mRdp->viewport, &mRenderingState.viewport, sizeof(mRdp->viewport)) != 0) {
-            Flush();
+if (mBufVboLen > 0) {
+    Flush();
+}
             mRapi->SetViewport(mRdp->viewport.x, mRdp->viewport.y, mRdp->viewport.width, mRdp->viewport.height);
             mRenderingState.viewport = mRdp->viewport;
         }
         if (memcmp(&mRdp->scissor, &mRenderingState.scissor, sizeof(mRdp->scissor)) != 0) {
-            Flush();
+if (mBufVboLen > 0) {
+    Flush();
+}
             mRapi->SetScissor(mRdp->scissor.x, mRdp->scissor.y, mRdp->scissor.width, mRdp->scissor.height);
             mRenderingState.scissor = mRdp->scissor;
         }
@@ -1518,7 +1526,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         uint32_t tile = mRdp->first_tile_index + i;
         if (comb->usedTextures[i]) {
             if (mRdp->textures_changed[i]) {
-                Flush();
+if (mBufVboLen > 0) {
+    Flush();
+}
                 ImportTexture(i, tile, false);
                 if (mRdp->loaded_texture[i].masked) {
                     ImportTextureMask(SHADER_FIRST_MASK_TEXTURE + i, tile);
@@ -1578,7 +1588,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             bool linear_filter = (mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
             if (linear_filter != mRenderingState.mTextures[i]->second.linear_filter ||
                 cms != mRenderingState.mTextures[i]->second.cms || cmt != mRenderingState.mTextures[i]->second.cmt) {
-                Flush();
+if (mBufVboLen > 0) {
+    Flush();
+}
 
                 // Set the same sampler params on the blended texture. Needed for opengl.
                 if (mRdp->loaded_texture[i].blended) {
@@ -1599,13 +1611,17 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             LookupOrCreateShaderProgram(comb->shader_id0, comb->shader_id1 | tm * SHADER_OPT(TEXEL0_CLAMP_S));
     }
     if (prg != mRenderingState.mShaderProgram) {
-        Flush();
+if (mBufVboLen > 0) {
+    Flush();
+}
         mRapi->UnloadShader(mRenderingState.mShaderProgram);
         mRapi->LoadShader(prg);
         mRenderingState.mShaderProgram = prg;
     }
     if (use_alpha != mRenderingState.alpha_blend) {
-        Flush();
+if (mBufVboLen > 0) {
+    Flush();
+}
         mRapi->SetUseAlpha(use_alpha);
         mRenderingState.alpha_blend = use_alpha;
     }
@@ -2437,11 +2453,19 @@ void Interpreter::GfxDpFillRectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
     }
     uint32_t mode = (mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE));
 
-    // OTRTODO: This is a bit of a hack for widescreen screen fades, but it'll work for now...
-    if (ulx == 0 && uly == 0 && lrx == (319 * 4) && lry == (239 * 4)) {
+// PSC WIDESCREEN HACK: Force any left-edge rectangle to the bezel
+    if (ulx <= 0) {
         ulx = -1024;
-        uly = -1024;
+    }
+    
+    // Force any right-edge rectangle to the bezel (319 * 4 = 1276)
+    if (lrx >= 1276) {
         lrx = 2048;
+    }
+
+    // Keep the full-screen height hack if needed
+    if (uly == 0 && lry == (239 * 4)) {
+        uly = -1024;
         lry = 2048;
     }
 
@@ -4688,3 +4712,4 @@ extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, uint32_t 
 extern "C" void gfx_texture_cache_clear() {
     Fast::mInstance.lock().get()->TextureCacheClear();
 }
+
